@@ -168,8 +168,8 @@ class BarcodeReader:
         Scan all pages of the PDF as images, updating barcodes and the pages
         found on as we go
         """
-        # Bail if barcodes already exist
-        if self.barcodes:
+        # Bail if barcodes already exist or we don't support this file type
+        if self.barcodes or not self.supported_mime_type:
             return
 
         # No op if not a TIFF
