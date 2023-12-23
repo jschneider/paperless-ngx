@@ -1,7 +1,9 @@
+import abc
 import hashlib
 import logging
 import shutil
 import uuid
+from typing import TYPE_CHECKING
 from typing import Optional
 
 import tqdm
@@ -9,6 +11,7 @@ from asgiref.sync import async_to_sync
 from celery import Task
 from celery import shared_task
 from channels.layers import get_channel_layer
+from channels_redis.pubsub import RedisPubSubChannelLayer
 from django.conf import settings
 from django.db import transaction
 from django.db.models.signals import post_save
@@ -93,6 +96,97 @@ def train_classifier():
 
     except Exception as e:
         logger.warning("Classifier error: " + str(e))
+
+
+class ProgressManager:
+    def __init__(self, filename: str) -> None:
+        self.filename = filename
+        self._channel: Optional[RedisPubSubChannelLayer] = None
+
+    def __enter__(self):
+        self.open()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def open(self) -> None:
+        """
+        If not already opened, gets the default channel layer
+        opened and ready to send messages
+        """
+        if self._channel is None:
+            self._channel = get_channel_layer()
+
+    def close(self) -> None:
+        """
+        If it was opened, flushes the channel layer
+        """
+        if self._channel is not None:
+            async_to_sync(self._channel.flush)
+            self._channel = None
+
+    def send_msg(
+        self,
+        status: str,
+        message: str,
+        current_progress: int,
+        max_progress: int,
+        task_id: Optional[str] = None,
+    ) -> None:
+        # Ensure the layer is open
+        self.open()
+
+        # Just for IDEs
+        if TYPE_CHECKING:
+            assert self._channel is not None
+
+        # Construct and send the update
+        async_to_sync(self._channel.group_send)(
+            "status_updates",
+            {
+                "type": "status_update",
+                "data": {
+                    "filename": self.filename,
+                    "task_id": task_id,
+                    "current_progress": current_progress,
+                    "max_progress": max_progress,
+                    "status": status,
+                    "message": message,
+                },
+            },
+        )
+
+
+class ConsumeTaskPlugin(abc.ABC):
+    def __init__(
+        self,
+        input_doc: ConsumableDocument,
+        metadata: DocumentMetadataOverrides,
+    ) -> None:
+        super().__init__()
+        self.input_doc = input_doc
+        self.metadata = metadata
+
+    @abc.abstractproperty
+    def able_to_run(self) -> bool:
+        pass
+
+    @abc.abstractproperty
+    def status(self):
+        pass
+
+    @abc.abstractmethod
+    def setup(self) -> None:
+        pass
+
+    @abc.abstractmethod
+    def cleanup(self) -> None:
+        pass
+
+    @abc.abstractmethod
+    def handle(self) -> None:
+        pass
 
 
 @shared_task(bind=True)
