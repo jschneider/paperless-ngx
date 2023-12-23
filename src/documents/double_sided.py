@@ -10,6 +10,7 @@ from pikepdf import Pdf
 from documents.consumer import ConsumerError
 from documents.converters import convert_from_tiff_to_pdf
 from documents.data_models import ConsumableDocument
+from documents.plugin import ConsumeTaskPlugin
 
 logger = logging.getLogger("paperless.double_sided")
 
@@ -18,6 +19,10 @@ TIMEOUT_MINUTES = 30
 
 # Used by test cases
 STAGING_FILE_NAME = "double-sided-staging.pdf"
+
+
+class CollatePlugin(ConsumeTaskPlugin):
+    pass
 
 
 def collate(input_doc: ConsumableDocument) -> str:

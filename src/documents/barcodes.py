@@ -17,8 +17,18 @@ from documents.converters import convert_from_tiff_to_pdf
 from documents.data_models import ConsumableDocument
 from documents.data_models import DocumentMetadataOverrides
 from documents.data_models import DocumentSource
+from documents.plugin import ConsumeTaskPlugin
 from documents.utils import copy_basic_file_stats
 from documents.utils import copy_file_with_basic_stats
+
+
+class BarcodeSplitPlugin(ConsumeTaskPlugin):
+    pass
+
+
+class BarcodeAsnPlugin(ConsumeTaskPlugin):
+    pass
+
 
 logger = logging.getLogger("paperless.barcodes")
 

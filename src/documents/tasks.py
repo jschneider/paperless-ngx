@@ -1,33 +1,32 @@
-import abc
 import hashlib
 import logging
 import shutil
 import uuid
-from typing import TYPE_CHECKING
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Optional
 
 import tqdm
-from asgiref.sync import async_to_sync
 from celery import Task
 from celery import shared_task
-from channels.layers import get_channel_layer
-from channels_redis.pubsub import RedisPubSubChannelLayer
 from django.conf import settings
 from django.db import transaction
 from django.db.models.signals import post_save
 from filelock import FileLock
-from redis.exceptions import ConnectionError
 from whoosh.writing import AsyncWriter
 
 from documents import index
 from documents import sanity_checker
+from documents.barcodes import BarcodeAsnPlugin
 from documents.barcodes import BarcodeReader
+from documents.barcodes import BarcodeSplitPlugin
 from documents.classifier import DocumentClassifier
 from documents.classifier import load_classifier
 from documents.consumer import Consumer
 from documents.consumer import ConsumerError
 from documents.data_models import ConsumableDocument
 from documents.data_models import DocumentMetadataOverrides
+from documents.double_sided import CollatePlugin
 from documents.double_sided import collate
 from documents.file_handling import create_source_path_directory
 from documents.file_handling import generate_unique_filename
@@ -38,6 +37,10 @@ from documents.models import StoragePath
 from documents.models import Tag
 from documents.parsers import DocumentParser
 from documents.parsers import get_parser_class_for_mime_type
+from documents.plugin import ConsumeTaskPlugin
+from documents.plugin import PluginStatusCode
+from documents.plugin import ProgressManager
+from documents.plugin import ProgressStatusOptions
 from documents.sanity_checker import SanityCheckFailedException
 
 if settings.AUDIT_LOG_ENABLED:
@@ -98,123 +101,58 @@ def train_classifier():
         logger.warning("Classifier error: " + str(e))
 
 
-class ProgressManager:
-    def __init__(self, filename: str) -> None:
-        self.filename = filename
-        self._channel: Optional[RedisPubSubChannelLayer] = None
-
-    def __enter__(self):
-        self.open()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
-
-    def open(self) -> None:
-        """
-        If not already opened, gets the default channel layer
-        opened and ready to send messages
-        """
-        if self._channel is None:
-            self._channel = get_channel_layer()
-
-    def close(self) -> None:
-        """
-        If it was opened, flushes the channel layer
-        """
-        if self._channel is not None:
-            async_to_sync(self._channel.flush)
-            self._channel = None
-
-    def send_msg(
-        self,
-        status: str,
-        message: str,
-        current_progress: int,
-        max_progress: int,
-        task_id: Optional[str] = None,
-    ) -> None:
-        # Ensure the layer is open
-        self.open()
-
-        # Just for IDEs
-        if TYPE_CHECKING:
-            assert self._channel is not None
-
-        # Construct and send the update
-        async_to_sync(self._channel.group_send)(
-            "status_updates",
-            {
-                "type": "status_update",
-                "data": {
-                    "filename": self.filename,
-                    "task_id": task_id,
-                    "current_progress": current_progress,
-                    "max_progress": max_progress,
-                    "status": status,
-                    "message": message,
-                },
-            },
-        )
-
-
-class ConsumeTaskPlugin(abc.ABC):
-    def __init__(
-        self,
-        input_doc: ConsumableDocument,
-        metadata: DocumentMetadataOverrides,
-    ) -> None:
-        super().__init__()
-        self.input_doc = input_doc
-        self.metadata = metadata
-
-    @abc.abstractproperty
-    def able_to_run(self) -> bool:
-        pass
-
-    @abc.abstractproperty
-    def status(self):
-        pass
-
-    @abc.abstractmethod
-    def setup(self) -> None:
-        pass
-
-    @abc.abstractmethod
-    def cleanup(self) -> None:
-        pass
-
-    @abc.abstractmethod
-    def handle(self) -> None:
-        pass
-
-
 @shared_task(bind=True)
 def consume_file(
     self: Task,
     input_doc: ConsumableDocument,
     overrides: Optional[DocumentMetadataOverrides] = None,
 ):
-    def send_progress(status="SUCCESS", message="finished"):
-        payload = {
-            "filename": overrides.filename or input_doc.original_file.name,
-            "task_id": None,
-            "current_progress": 100,
-            "max_progress": 100,
-            "status": status,
-            "message": message,
-        }
-        try:
-            async_to_sync(get_channel_layer().group_send)(
-                "status_updates",
-                {"type": "status_update", "data": payload},
-            )
-        except ConnectionError as e:
-            logger.warning(f"ConnectionError on status send: {e!s}")
-
     # Default no overrides
     if overrides is None:
         overrides = DocumentMetadataOverrides()
+
+    plugins: list[type[ConsumeTaskPlugin]] = []
+
+    if settings.CONSUMER_ENABLE_COLLATE_DOUBLE_SIDED and (
+        settings.CONSUMER_COLLATE_DOUBLE_SIDED_SUBDIR_NAME
+        in input_doc.original_file.parts
+    ):
+        plugins.append(CollatePlugin)
+
+    if settings.CONSUMER_ENABLE_BARCODES:
+        plugins.append(BarcodeSplitPlugin)
+    if settings.CONSUMER_ENABLE_ASN_BARCODE:
+        plugins.append(BarcodeAsnPlugin)
+
+    # TODO, based on settings, build the plugin list
+
+    with ProgressManager(
+        overrides.filename or input_doc.original_file.name,
+        self.request.id,
+    ) as status_mgr, TemporaryDirectory(dir=settings.SCRATCH_DIR) as tmp_dir:
+        tmp_dir = Path(tmp_dir)
+        for plugin_class in plugins:
+            plugin = plugin_class(input_doc, overrides, status_mgr, tmp_dir)
+            if not plugin.able_to_run:
+                continue
+            try:
+                plugin.setup()
+
+                plugin.handle()
+
+                status = plugin.status
+                if status.code == PluginStatusCode.EXIT_TASk:
+                    return status.message
+
+                # TODO: Need to pass data back to here (for the ASN at least)
+                # Is this a good way?
+                overrides = plugin.metadata
+
+            except Exception as e:
+                status_mgr.send_msg(ProgressStatusOptions.FAILED, f"{e}", 100, 100)
+                raise
+            finally:
+                plugin.cleanup()
 
     # Handle collation of double-sided documents scanned in two parts
     if settings.CONSUMER_ENABLE_COLLATE_DOUBLE_SIDED and (
@@ -223,10 +161,10 @@ def consume_file(
     ):
         try:
             msg = collate(input_doc)
-            send_progress(message=msg)
+            # send_progress(message=msg)
             return msg
         except ConsumerError as e:
-            send_progress(status="FAILURE", message=e.args[0])
+            # send_progress(status="FAILURE", message=e.args[0])
             raise e
 
     # read all barcodes in the current document
@@ -244,7 +182,7 @@ def consume_file(
             ):
                 # notify the sender, otherwise the progress bar
                 # in the UI stays stuck
-                send_progress()
+                # send_progress()
                 # consuming stops here, since the original document with
                 # the barcodes has been split and will be consumed separately
                 input_doc.original_file.unlink()
