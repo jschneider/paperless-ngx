@@ -1,5 +1,4 @@
 import abc
-import dataclasses
 import enum
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -21,6 +20,11 @@ class ProgressStatusOptions(str, enum.Enum):
 
 
 class ProgressManager:
+    """
+    Handles sending of progress information via the channel layer, with proper management
+    of the open/close of the layer to ensure messages go out and everything is cleaned up
+    """
+
     def __init__(self, filename: str, task_id: Optional[str] = None) -> None:
         self.filename = filename
         self._channel: Optional[RedisPubSubChannelLayer] = None
@@ -49,7 +53,7 @@ class ProgressManager:
             async_to_sync(self._channel.flush)
             self._channel = None
 
-    def send_msg(
+    def send_progress(
         self,
         status: ProgressStatusOptions,
         message: str,
@@ -81,35 +85,60 @@ class ProgressManager:
         )
 
 
-class PluginStatusCode(enum.Enum):
-    # Continue to next plugin (if any)
-    CONTINUE = enum.auto()
-    # Exit the consume task (probably because a new task was created)
-    EXIT_TASk = enum.auto()
+class StopConsumeTaskError(Exception):
+    """
+    A plugin setup or handle may raise this to exit the asynchronous consume task.
 
+    Most likely, this means it has created one or more new tasks to execute instead,
+    such as when a barcode has been used to create new documents
+    """
 
-@dataclasses.dataclass
-class PluginStatus:
-    code: PluginStatusCode
-    message: Optional[str] = None
-
-
-CONTINUE_STATUS = PluginStatus(PluginStatusCode.CONTINUE)
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
 
 
 class ConsumeTaskPlugin(abc.ABC):
+    """
+    Defines the interface for a plugin for the document consume task
+    Meanings as per RFC2119 (https://datatracker.ietf.org/doc/html/rfc2119)
+
+    Plugin Implementation
+
+    The plugin SHALL implement property able_to_run and methods setup, handle and cleanup.
+    The plugin property able_to_run SHALL return True if the plugin is able to run, given the conditions, settings and document information.
+    The plugin property able_to_run MAY be hardcoded to return True.
+    The plugin setup SHOULD preform any resource creation or additional initialization needed to handle the document.
+    The plugin setup MAY be a non-operation.
+    The plugin cleanup SHOULD preform resource cleanup, including in the event of an error.
+    The plugin cleanup MAY be a non-operation.
+    The plugin handle SHALL preform any operations against the document or system state required for the plugin.
+    The plugin handle MAY update the document metadata.
+    The plugin handle MAY return an informational message.
+    The plugin handle MAY raise StopConsumeTaskError to cease any further operations against the document.
+
+    Plugin Manager Implementation
+
+    The plugin manager SHALL provide the plugin with the input document, document metadata, progress manager and a create temporary directory.
+    The plugin manager SHALL execute the plugin setup, handle and cleanup, in that order IF the plugin property able_to_run is True.
+    The plugin manager SHOULD log the return message of executing a plugin's handle.
+    The plugin manager SHALL always execute the plugin cleanup, IF the plugin property able_to_run is True.
+    The plugin manager SHALL cease calling plugins and exit the task IF a plugin raises StopConsumeTaskError.
+    The plugin manager SHOULD return the StopConsumeTaskError message IF a plugin raises StopConsumeTaskError.
+    """
+
     def __init__(
         self,
         input_doc: ConsumableDocument,
         metadata: DocumentMetadataOverrides,
-        status: ProgressManager,
+        status_mgr: ProgressManager,
         base_tmp_dir: Path,
     ) -> None:
         super().__init__()
         self.input_doc = input_doc
         self.metadata = metadata
         self.base_tmp_dir = base_tmp_dir
-        self.status_mgr = status
+        self.status_mgr = status_mgr
 
     @abc.abstractproperty
     def able_to_run(self) -> bool:
@@ -118,16 +147,6 @@ class ConsumeTaskPlugin(abc.ABC):
 
         If False, setup(), handle() and cleanup() will not be called
         """
-
-    @abc.abstractproperty
-    def status(self) -> PluginStatus:
-        """
-        Allows the plugin to affect the progression of the consume task.  If
-        a status with a code to exit the task is returned, the task will
-        return with the given message string, not processing further plugins
-        """
-        # TODO: Another option is a special Exception, ie ExitConsumeTaskError which
-        # includes the reason as the message and is caught by the task
 
     @abc.abstractmethod
     def setup(self) -> None:

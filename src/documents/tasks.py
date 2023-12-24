@@ -38,9 +38,9 @@ from documents.models import Tag
 from documents.parsers import DocumentParser
 from documents.parsers import get_parser_class_for_mime_type
 from documents.plugin import ConsumeTaskPlugin
-from documents.plugin import PluginStatusCode
 from documents.plugin import ProgressManager
 from documents.plugin import ProgressStatusOptions
+from documents.plugin import StopConsumeTaskError
 from documents.sanity_checker import SanityCheckFailedException
 
 if settings.AUDIT_LOG_ENABLED:
@@ -138,18 +138,20 @@ def consume_file(
             try:
                 plugin.setup()
 
-                plugin.handle()
+                msg = plugin.handle()
+                if msg is not None:
+                    logger.info(f"{plugin_class} completed with: {msg}")
+                else:
+                    logger.info(f"{plugin_class} completed with no message")
 
-                status = plugin.status
-                if status.code == PluginStatusCode.EXIT_TASk:
-                    return status.message
-
-                # TODO: Need to pass data back to here (for the ASN at least)
-                # Is this a good way?
                 overrides = plugin.metadata
 
+            except StopConsumeTaskError as e:
+                logger.info(f"{plugin_class} requested task exit: {e.message}")
+                return e.message
+
             except Exception as e:
-                status_mgr.send_msg(ProgressStatusOptions.FAILED, f"{e}", 100, 100)
+                status_mgr.send_progress(ProgressStatusOptions.FAILED, f"{e}", 100, 100)
                 raise
             finally:
                 plugin.cleanup()
