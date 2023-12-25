@@ -74,7 +74,7 @@ class BarcodePlugin(ConsumeTaskPlugin):
         self._tiff_conversion_done = False
         self.barcodes: list[Barcode] = []
 
-    def run(self):
+    def run(self) -> Optional[str]:
         # Maybe do the conversion of TIFF to PDF
         self.convert_from_tiff_to_pdf()
 
@@ -122,8 +122,9 @@ class BarcodePlugin(ConsumeTaskPlugin):
         # This file is now two or more files
         self.input_doc.original_file.unlink()
 
-        # Update the progress to complete
         msg = "Barcode splitting complete!"
+
+        # Update the progress to complete
         self.status_mgr.send_progress(ProgressStatusOptions.SUCCESS, msg, 100, 100)
 
         # Request the consume task stops
