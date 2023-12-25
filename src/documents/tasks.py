@@ -27,7 +27,6 @@ from documents.consumer import ConsumerError
 from documents.data_models import ConsumableDocument
 from documents.data_models import DocumentMetadataOverrides
 from documents.double_sided import CollatePlugin
-from documents.double_sided import collate
 from documents.file_handling import create_source_path_directory
 from documents.file_handling import generate_unique_filename
 from documents.models import Correspondent
@@ -111,20 +110,12 @@ def consume_file(
     if overrides is None:
         overrides = DocumentMetadataOverrides()
 
-    plugins: list[type[ConsumeTaskPlugin]] = []
-
-    if settings.CONSUMER_ENABLE_COLLATE_DOUBLE_SIDED and (
-        settings.CONSUMER_COLLATE_DOUBLE_SIDED_SUBDIR_NAME
-        in input_doc.original_file.parts
-    ):
-        plugins.append(CollatePlugin)
-
-    if settings.CONSUMER_ENABLE_BARCODES:
-        plugins.append(BarcodeSplitPlugin)
-    if settings.CONSUMER_ENABLE_ASN_BARCODE:
-        plugins.append(BarcodeAsnPlugin)
-
-    # TODO, based on settings, build the plugin list
+    plugins: list[type[ConsumeTaskPlugin]] = [
+        CollatePlugin,
+        # TODO: Could maybe just combine these, benefit is single time decoding the file
+        BarcodeSplitPlugin,
+        BarcodeAsnPlugin,
+    ]
 
     with ProgressManager(
         overrides.filename or input_doc.original_file.name,
@@ -132,13 +123,21 @@ def consume_file(
     ) as status_mgr, TemporaryDirectory(dir=settings.SCRATCH_DIR) as tmp_dir:
         tmp_dir = Path(tmp_dir)
         for plugin_class in plugins:
-            plugin = plugin_class(input_doc, overrides, status_mgr, tmp_dir)
+            plugin = plugin_class(
+                input_doc,
+                overrides,
+                status_mgr,
+                tmp_dir,
+                self.request.id,
+            )
             if not plugin.able_to_run:
+                logger.debug(f"Skipping plugin {plugin_class}")
                 continue
             try:
                 plugin.setup()
 
-                msg = plugin.handle()
+                msg = plugin.run()
+
                 if msg is not None:
                     logger.info(f"{plugin_class} completed with: {msg}")
                 else:
@@ -151,23 +150,12 @@ def consume_file(
                 return e.message
 
             except Exception as e:
+                logger.exception(f"{plugin_class} failed: {e}")
                 status_mgr.send_progress(ProgressStatusOptions.FAILED, f"{e}", 100, 100)
                 raise
+
             finally:
                 plugin.cleanup()
-
-    # Handle collation of double-sided documents scanned in two parts
-    if settings.CONSUMER_ENABLE_COLLATE_DOUBLE_SIDED and (
-        settings.CONSUMER_COLLATE_DOUBLE_SIDED_SUBDIR_NAME
-        in input_doc.original_file.parts
-    ):
-        try:
-            msg = collate(input_doc)
-            # send_progress(message=msg)
-            return msg
-        except ConsumerError as e:
-            # send_progress(status="FAILURE", message=e.args[0])
-            raise e
 
     # read all barcodes in the current document
     if settings.CONSUMER_ENABLE_BARCODES or settings.CONSUMER_ENABLE_ASN_BARCODE:

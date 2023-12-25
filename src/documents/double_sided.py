@@ -22,7 +22,12 @@ STAGING_FILE_NAME = "double-sided-staging.pdf"
 
 
 class CollatePlugin(ConsumeTaskPlugin):
-    pass
+    def able_to_run(self) -> bool:
+        return (
+            settings.CONSUMER_ENABLE_COLLATE_DOUBLE_SIDED
+            and settings.CONSUMER_COLLATE_DOUBLE_SIDED_SUBDIR_NAME
+            in self.input_doc.original_file.parts
+        )
 
 
 def collate(input_doc: ConsumableDocument) -> str:

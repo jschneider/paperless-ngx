@@ -21,15 +21,6 @@ from documents.plugin import ConsumeTaskPlugin
 from documents.utils import copy_basic_file_stats
 from documents.utils import copy_file_with_basic_stats
 
-
-class BarcodeSplitPlugin(ConsumeTaskPlugin):
-    pass
-
-
-class BarcodeAsnPlugin(ConsumeTaskPlugin):
-    pass
-
-
 logger = logging.getLogger("paperless.barcodes")
 
 
@@ -57,6 +48,26 @@ class Barcode:
         False otherwise
         """
         return self.value.startswith(settings.CONSUMER_ASN_BARCODE_PREFIX)
+
+
+class _BaseBarcodePlugin(ConsumeTaskPlugin):
+    def able_to_run(self) -> bool:
+        if settings.CONSUMER_BARCODE_TIFF_SUPPORT:
+            supported_mimes = {"application/pdf", "image/tiff"}
+        else:
+            supported_mimes = {"application/pdf"}
+        return (
+            settings.CONSUMER_ENABLE_BARCODES
+            and self.input_doc.mime_type in supported_mimes
+        )
+
+
+class BarcodeSplitPlugin(_BaseBarcodePlugin):
+    pass
+
+
+class BarcodeAsnPlugin(_BaseBarcodePlugin):
+    pass
 
 
 class BarcodeReader:
