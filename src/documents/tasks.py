@@ -17,9 +17,7 @@ from whoosh.writing import AsyncWriter
 
 from documents import index
 from documents import sanity_checker
-from documents.barcodes import BarcodeAsnPlugin
-from documents.barcodes import BarcodeReader
-from documents.barcodes import BarcodeSplitPlugin
+from documents.barcodes import BarcodePlugin
 from documents.classifier import DocumentClassifier
 from documents.classifier import load_classifier
 from documents.consumer import Consumer
@@ -112,9 +110,7 @@ def consume_file(
 
     plugins: list[type[ConsumeTaskPlugin]] = [
         CollatePlugin,
-        # TODO: Could maybe just combine these, benefit is single time decoding the file
-        BarcodeSplitPlugin,
-        BarcodeAsnPlugin,
+        BarcodePlugin,
     ]
 
     with ProgressManager(
@@ -156,38 +152,6 @@ def consume_file(
 
             finally:
                 plugin.cleanup()
-
-    # read all barcodes in the current document
-    if settings.CONSUMER_ENABLE_BARCODES or settings.CONSUMER_ENABLE_ASN_BARCODE:
-        with BarcodeReader(input_doc.original_file, input_doc.mime_type) as reader:
-            # Look for barcodes in the file
-            reader.detect()
-            if (
-                settings.CONSUMER_ENABLE_BARCODES
-                and reader.barcodes
-                and reader.separate(
-                    input_doc.source,
-                    overrides,
-                )
-            ):
-                # notify the sender, otherwise the progress bar
-                # in the UI stays stuck
-                # send_progress()
-                # consuming stops here, since the original document with
-                # the barcodes has been split and will be consumed separately
-                input_doc.original_file.unlink()
-                return "File successfully split"
-
-            # try reading the ASN from barcode
-            if (
-                settings.CONSUMER_ENABLE_ASN_BARCODE
-                and reader.barcodes
-                and reader.asn is not None
-            ):
-                # Note this will take precedence over an API provided ASN
-                # But it's from a physical barcode, so that's good
-                overrides.asn = reader.asn
-                logger.info(f"Found ASN in barcode: {overrides.asn}")
 
     template_overrides = Consumer().get_template_overrides(
         input_doc=input_doc,

@@ -163,7 +163,7 @@ class ConsumeTaskPlugin(abc.ABC):
         """
 
     @abc.abstractmethod
-    def run(self) -> None:
+    def run(self) -> Optional[str]:
         """
         The bulk of plugin processing, this does whatever action the plugin is for.
 
