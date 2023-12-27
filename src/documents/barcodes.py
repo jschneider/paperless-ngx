@@ -142,27 +142,11 @@ class BarcodePlugin(ConsumeTaskPlugin):
         if self.input_doc.mime_type != "image/tiff" or self._tiff_conversion_done:
             return
 
-        self._tiff_conversion_done = True
         self.pdf_file = convert_from_tiff_to_pdf(
             self.input_doc.original_file,
             Path(self.temp_dir.name),
         )
-
-        if asn_text:
-            logger.debug(f"Found ASN Barcode: {asn_text}")
-            # remove the prefix and remove whitespace
-            asn_text = asn_text[len(settings.CONSUMER_ASN_BARCODE_PREFIX) :].strip()
-
-            # remove non-numeric parts of the remaining string
-            asn_text = re.sub(r"\D", "", asn_text)
-
-            # now, try parsing the ASN number
-            try:
-                asn = int(asn_text)
-            except ValueError as e:
-                logger.warning(f"Failed to parse ASN number because: {e}")
-
-        return asn
+        self._tiff_conversion_done = True
 
     @staticmethod
     def read_barcodes_zxing(image: Image.Image) -> list[str]:
@@ -281,7 +265,7 @@ class BarcodePlugin(ConsumeTaskPlugin):
             asn_text = asn_text[len(settings.CONSUMER_ASN_BARCODE_PREFIX) :].strip()
 
             # remove non-numeric parts of the remaining string
-            asn_text = re.sub("[^0-9]", "", asn_text)
+            asn_text = re.sub(r"\D", "", asn_text)
 
             # now, try parsing the ASN number
             try:

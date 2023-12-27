@@ -1,17 +1,12 @@
 import datetime
 import hashlib
 import os
-import tempfile
-import uuid
 from enum import Enum
 from pathlib import Path
 from subprocess import CompletedProcess
 from subprocess import run
 from typing import Optional
 
-import magic
-from asgiref.sync import async_to_sync
-from channels.layers import get_channel_layer
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.db import transaction
@@ -21,7 +16,6 @@ from filelock import FileLock
 from rest_framework.reverse import reverse
 
 from documents.classifier import load_classifier
-from documents.data_models import ConsumableDocument
 from documents.data_models import DocumentMetadataOverrides
 from documents.file_handling import create_source_path_directory
 from documents.file_handling import generate_unique_filename
@@ -41,6 +35,11 @@ from documents.parsers import ParseError
 from documents.parsers import get_parser_class_for_mime_type
 from documents.parsers import parse_date
 from documents.permissions import set_permissions_for_object
+from documents.plugin import AlwaysRunPluginMixin
+from documents.plugin import ConsumeTaskPlugin
+from documents.plugin import NoCleanupPluginMixin
+from documents.plugin import NoSetupPluginMixin
+from documents.plugin import ProgressStatusOptions
 from documents.signals import document_consumption_finished
 from documents.signals import document_consumption_started
 from documents.utils import copy_basic_file_stats
@@ -70,88 +69,369 @@ class ConsumerStatusShortMessage(str, Enum):
     FAILED = "failed"
 
 
-class ConsumerFilePhase(str, Enum):
-    STARTED = "STARTED"
-    WORKING = "WORKING"
-    SUCCESS = "SUCCESS"
-    FAILED = "FAILED"
+class ConsumeTemplatePlugin(
+    NoCleanupPluginMixin,
+    NoSetupPluginMixin,
+    AlwaysRunPluginMixin,
+    ConsumeTaskPlugin,
+):
+    def run(self) -> Optional[str]:
+        """
+        Match consumption templates to a document based on source and
+        file name filters, path filters or mail rule filter if specified
+        """
+        overrides = DocumentMetadataOverrides()
+        for template in ConsumptionTemplate.objects.all().order_by("order"):
+            template_overrides = DocumentMetadataOverrides()
+
+            if document_matches_template(self.input_doc, template):
+                if template.assign_title is not None:
+                    template_overrides.title = template.assign_title
+                if template.assign_tags is not None:
+                    template_overrides.tag_ids = [
+                        tag.pk for tag in template.assign_tags.all()
+                    ]
+                if template.assign_correspondent is not None:
+                    template_overrides.correspondent_id = (
+                        template.assign_correspondent.pk
+                    )
+                if template.assign_document_type is not None:
+                    template_overrides.document_type_id = (
+                        template.assign_document_type.pk
+                    )
+                if template.assign_storage_path is not None:
+                    template_overrides.storage_path_id = template.assign_storage_path.pk
+                if template.assign_owner is not None:
+                    template_overrides.owner_id = template.assign_owner.pk
+                if template.assign_view_users is not None:
+                    template_overrides.view_users = [
+                        user.pk for user in template.assign_view_users.all()
+                    ]
+                if template.assign_view_groups is not None:
+                    template_overrides.view_groups = [
+                        group.pk for group in template.assign_view_groups.all()
+                    ]
+                if template.assign_change_users is not None:
+                    template_overrides.change_users = [
+                        user.pk for user in template.assign_change_users.all()
+                    ]
+                if template.assign_change_groups is not None:
+                    template_overrides.change_groups = [
+                        group.pk for group in template.assign_change_groups.all()
+                    ]
+                if template.assign_custom_fields is not None:
+                    template_overrides.custom_field_ids = [
+                        field.pk for field in template.assign_custom_fields.all()
+                    ]
+
+                overrides.update(template_overrides)
+        self.metadata.update(overrides)
 
 
-class Consumer(LoggingMixin):
+class ConsumerPlugin(AlwaysRunPluginMixin, LoggingMixin, ConsumeTaskPlugin):
     logging_name = "paperless.consumer"
 
-    def _send_progress(
-        self,
-        current_progress: int,
-        max_progress: int,
-        status: ConsumerFilePhase,
-        message: Optional[ConsumerStatusShortMessage] = None,
-        document_id=None,
-    ):  # pragma: no cover
-        payload = {
-            "filename": os.path.basename(self.filename) if self.filename else None,
-            "task_id": self.task_id,
-            "current_progress": current_progress,
-            "max_progress": max_progress,
-            "status": status,
-            "message": message,
-            "document_id": document_id,
-            "owner_id": self.override_owner_id if self.override_owner_id else None,
-        }
-        async_to_sync(self.channel_layer.group_send)(
-            "status_updates",
-            {"type": "status_update", "data": payload},
+    def setup(self) -> None:
+        """
+        Allows the plugin to preform any additional setup it may need, such as creating
+        a temporary directory, copying a file somewhere, etc.
+
+        Executed before run()
+
+        In general, this should be the "light" work, not the bulk of processing
+        """
+
+        # Make sure that preconditions for consuming the file are met.
+        self.pre_check_file_exists()
+        self.pre_check_directories()
+        self.pre_check_duplicate()
+        self.pre_check_asn_value()
+
+    def run(self) -> Optional[str]:
+        """
+        The bulk of plugin processing, this does whatever action the plugin is for.
+
+        Executed after setup() and before cleanup()
+        """
+
+        """
+        Return the document object if it was successfully created.
+        """
+        self.filename = self.metadata.filename or self.input_doc.original_file.name
+        self.override_title = self.metadata.title
+        self.override_correspondent_id = self.metadata.correspondent_id
+        self.override_document_type_id = self.metadata.document_type_id
+        self.override_tag_ids = self.metadata.tag_ids
+        self.override_storage_path_id = self.metadata.storage_path_id
+        self.override_created = self.metadata.created
+        self.override_asn = self.metadata.asn
+        self.override_owner_id = self.metadata.owner_id
+        self.override_view_users = self.metadata.view_users
+        self.override_view_groups = self.metadata.view_groups
+        self.override_change_users = self.metadata.change_users
+        self.override_change_groups = self.metadata.change_groups
+        self.override_custom_field_ids = self.metadata.custom_field_ids
+
+        self._send_progress(
+            0,
+            100,
+            ProgressStatusOptions.STARTED,
+            ConsumerStatusShortMessage.NEW_FILE,
         )
 
-    def _fail(
-        self,
-        message: ConsumerStatusShortMessage,
-        log_message: Optional[str] = None,
-        exc_info=None,
-        exception: Optional[Exception] = None,
-    ):
-        self._send_progress(100, 100, ConsumerFilePhase.FAILED, message)
-        self.log.error(log_message or message, exc_info=exc_info)
-        raise ConsumerError(f"{self.filename}: {log_message or message}") from exception
+        self.log.info(f"Consuming {self.filename}")
 
-    def __init__(self):
-        super().__init__()
-        self.path: Optional[Path] = None
-        self.original_path: Optional[Path] = None
-        self.filename = None
-        self.override_title = None
-        self.override_correspondent_id = None
-        self.override_tag_ids = None
-        self.override_document_type_id = None
-        self.override_asn = None
-        self.task_id = None
-        self.override_owner_id = None
-        self.override_custom_field_ids = None
+        # For the actual work, copy the file into a tempdir location, so we can modify a version of it
+        self.working_copy = self.base_tmp_dir / self.filename
+        copy_file_with_basic_stats(self.input_doc.original_file, self.working_copy)
 
-        self.channel_layer = get_channel_layer()
+        # Determine the parser class.
+        self.log.debug(f"Detected mime type: {self.input_doc.mime_type}")
+
+        # Based on the mime type, get the parser for that type
+        parser_class: Optional[type[DocumentParser]] = get_parser_class_for_mime_type(
+            self.input_doc.mime_type,
+        )
+        if not parser_class:
+            self._fail(
+                ConsumerStatusShortMessage.UNSUPPORTED_TYPE,
+                f"Unsupported mime type {self.input_doc.mime_type}",
+            )
+
+        # Notify all listeners that we're going to do some work.
+
+        document_consumption_started.send(
+            sender=self.__class__,
+            filename=self.input_doc.original_file,
+            logging_group=self.logging_group,
+        )
+
+        self.run_pre_consume_script()
+
+        def progress_callback(current_progress, max_progress):  # pragma: no cover
+            # recalculate progress to be within 20 and 80
+            p = int((current_progress / max_progress) * 50 + 20)
+            self._send_progress(p, 100, ProgressStatusOptions.WORKING)
+
+        # This doesn't parse the document yet, but gives us a parser.
+
+        document_parser: DocumentParser = parser_class(
+            self.logging_group,
+            progress_callback,
+        )
+
+        self.log.debug(f"Parser: {type(document_parser).__name__}")
+
+        # However, this already created working directories which we have to
+        # clean up.
+
+        # Parse the document. This may take some time.
+
+        text = None
+        date = None
+        thumbnail = None
+        archive_path = None
+
+        try:
+            self._send_progress(
+                20,
+                100,
+                ProgressStatusOptions.WORKING,
+                ConsumerStatusShortMessage.PARSING_DOCUMENT,
+            )
+            self.log.debug(f"Parsing {self.filename}...")
+            document_parser.parse(
+                self.working_copy,
+                self.input_doc.mime_type,
+                self.filename,
+            )
+
+            self.log.debug(f"Generating thumbnail for {self.filename}...")
+            self._send_progress(
+                70,
+                100,
+                ProgressStatusOptions.WORKING,
+                ConsumerStatusShortMessage.GENERATING_THUMBNAIL,
+            )
+            thumbnail = document_parser.get_thumbnail(
+                self.working_copy,
+                self.input_doc.mime_type,
+                self.filename,
+            )
+
+            text = document_parser.get_text()
+            date = document_parser.get_date()
+            if date is None:
+                self._send_progress(
+                    90,
+                    100,
+                    ProgressStatusOptions.WORKING,
+                    ConsumerStatusShortMessage.PARSE_DATE,
+                )
+                date = parse_date(self.filename, text)
+            archive_path = document_parser.get_archive_path()
+
+        except ParseError as e:
+            self._fail(
+                str(e),
+                f"Error occurred while consuming document {self.filename}: {e}",
+                exc_info=True,
+                exception=e,
+            )
+        except Exception as e:
+            document_parser.cleanup()
+            self._fail(
+                str(e),
+                f"Unexpected error while consuming document {self.filename}: {e}",
+                exc_info=True,
+                exception=e,
+            )
+
+        # Prepare the document classifier.
+
+        # TODO: I don't really like to do this here, but this way we avoid
+        #   reloading the classifier multiple times, since there are multiple
+        #   post-consume hooks that all require the classifier.
+
+        classifier = load_classifier()
+
+        self._send_progress(
+            95,
+            100,
+            ProgressStatusOptions.WORKING,
+            ConsumerStatusShortMessage.SAVE_DOCUMENT,
+        )
+        # now that everything is done, we can start to store the document
+        # in the system. This will be a transaction and reasonably fast.
+        try:
+            with transaction.atomic():
+                # store the document.
+                document = self._store(
+                    text=text,
+                    date=date,
+                    mime_type=self.input_doc.mime_type,
+                )
+
+                # If we get here, it was successful. Proceed with post-consume
+                # hooks. If they fail, nothing will get changed.
+
+                document_consumption_finished.send(
+                    sender=self.__class__,
+                    document=document,
+                    logging_group=self.logging_group,
+                    classifier=classifier,
+                )
+
+                # After everything is in the database, copy the files into
+                # place. If this fails, we'll also rollback the transaction.
+                with FileLock(settings.MEDIA_LOCK):
+                    document.filename = generate_unique_filename(document)
+                    create_source_path_directory(document.source_path)
+
+                    self._write(
+                        document.storage_type,
+                        self.input_doc.original_file,
+                        document.source_path,
+                    )
+
+                    self._write(
+                        document.storage_type,
+                        thumbnail,
+                        document.thumbnail_path,
+                    )
+
+                    if archive_path and os.path.isfile(archive_path):
+                        document.archive_filename = generate_unique_filename(
+                            document,
+                            archive_filename=True,
+                        )
+                        create_source_path_directory(document.archive_path)
+                        self._write(
+                            document.storage_type,
+                            archive_path,
+                            document.archive_path,
+                        )
+
+                        with open(archive_path, "rb") as f:
+                            document.archive_checksum = hashlib.md5(
+                                f.read(),
+                            ).hexdigest()
+
+                # Don't save with the lock active. Saving will cause the file
+                # renaming logic to acquire the lock as well.
+                # This triggers things like file renaming
+                document.save()
+
+                # Delete the file only if it was successfully consumed
+                self.log.debug(f"Deleting file {self.input_doc.original_file}")
+                self.input_doc.original_file.unlink()
+
+                # https://github.com/jonaswinkler/paperless-ng/discussions/1037
+                shadow_file = (
+                    self.input_doc.original_file.parent
+                    / f"._{self.input_doc.original_file.name}"
+                )
+
+                if shadow_file.exists() and shadow_file.is_file():
+                    self.log.debug(f"Deleting file {shadow_file}")
+                    shadow_file.unlink()
+
+                self.run_post_consume_script(document)
+
+                self.log.info(f"Document {document} consumption finished")
+
+                self._send_progress(
+                    100,
+                    100,
+                    ProgressStatusOptions.SUCCESS,
+                    ConsumerStatusShortMessage.FINISHED,
+                    document.id,
+                )
+
+                # Return the most up to date fields
+                document.refresh_from_db()
+
+                return document
+
+        except Exception as e:
+            self._fail(
+                str(e),
+                f"The following error occurred while storing document "
+                f"{self.filename} after parsing: {e}",
+                exc_info=True,
+                exception=e,
+            )
+        finally:
+            document_parser.cleanup()
+
+    def cleanup(self) -> None:
+        """
+        Allows the plugin to execute any cleanup it may require
+
+        Executed after run(), even in the case of error
+        """
 
     def pre_check_file_exists(self):
         """
         Confirm the input file still exists where it should
         """
-        if not os.path.isfile(self.path):
+        if not self.input_doc.original_file.exists():
             self._fail(
                 ConsumerStatusShortMessage.FILE_NOT_FOUND,
-                f"Cannot consume {self.path}: File not found.",
+                f"Cannot consume {self.input_doc.original_file}: File not found.",
             )
 
     def pre_check_duplicate(self):
         """
         Using the MD5 of the file, check this exact file doesn't already exist
         """
-        with open(self.path, "rb") as f:
-            checksum = hashlib.md5(f.read()).hexdigest()
+        checksum = hashlib.md5(self.input_doc.original_file.read_bytes()).hexdigest()
         existing_doc = Document.objects.filter(
             Q(checksum=checksum) | Q(archive_checksum=checksum),
         )
         if existing_doc.exists():
             if settings.CONSUMER_DELETE_DUPLICATES:
-                os.unlink(self.path)
+                self.input_doc.original_file.unlink()
             self._fail(
                 ConsumerStatusShortMessage.DOCUMENT_ALREADY_EXISTS,
                 f"Not consuming {self.filename}: It is a duplicate of"
@@ -193,6 +473,36 @@ class Consumer(LoggingMixin):
                 f"Not consuming {self.filename}: Given ASN already exists!",
             )
 
+    def _send_progress(
+        self,
+        current_progress: int,
+        max_progress: int,
+        status: ProgressStatusOptions,
+        message: Optional[ConsumerStatusShortMessage] = None,
+        document_id=None,
+    ):  # pragma: no cover
+        self.status_mgr.send_progress(
+            status=status,
+            msg=message,
+            current_progress=current_progress,
+            max_progress=max_progress,
+            extra_args={
+                "document_id": document_id,
+                "owner_id": self.override_owner_id if self.override_owner_id else None,
+            },
+        )
+
+    def _fail(
+        self,
+        message: ConsumerStatusShortMessage,
+        log_message: Optional[str] = None,
+        exc_info=None,
+        exception: Optional[Exception] = None,
+    ):
+        self._send_progress(100, 100, ProgressStatusOptions.FAILED, message)
+        self.log.error(log_message or message, exc_info=exc_info)
+        raise ConsumerError(f"{self.filename}: {log_message or message}") from exception
+
     def run_pre_consume_script(self):
         """
         If one is configured and exists, run the pre-consume script and
@@ -210,8 +520,8 @@ class Consumer(LoggingMixin):
 
         self.log.info(f"Executing pre-consume script {settings.PRE_CONSUME_SCRIPT}")
 
-        working_file_path = str(self.path)
-        original_file_path = str(self.original_path)
+        working_file_path = str(self.working_copy)
+        original_file_path = str(self.input_doc.original_file)
 
         script_env = os.environ.copy()
         script_env["DOCUMENT_SOURCE_PATH"] = original_file_path
@@ -319,344 +629,6 @@ class Consumer(LoggingMixin):
                 exception=e,
             )
 
-    def try_consume_file(
-        self,
-        path: Path,
-        override_filename=None,
-        override_title=None,
-        override_correspondent_id=None,
-        override_document_type_id=None,
-        override_tag_ids=None,
-        override_storage_path_id=None,
-        task_id=None,
-        override_created=None,
-        override_asn=None,
-        override_owner_id=None,
-        override_view_users=None,
-        override_view_groups=None,
-        override_change_users=None,
-        override_change_groups=None,
-        override_custom_field_ids=None,
-    ) -> Document:
-        """
-        Return the document object if it was successfully created.
-        """
-
-        self.path = Path(path).resolve()
-        self.filename = override_filename or self.path.name
-        self.override_title = override_title
-        self.override_correspondent_id = override_correspondent_id
-        self.override_document_type_id = override_document_type_id
-        self.override_tag_ids = override_tag_ids
-        self.override_storage_path_id = override_storage_path_id
-        self.task_id = task_id or str(uuid.uuid4())
-        self.override_created = override_created
-        self.override_asn = override_asn
-        self.override_owner_id = override_owner_id
-        self.override_view_users = override_view_users
-        self.override_view_groups = override_view_groups
-        self.override_change_users = override_change_users
-        self.override_change_groups = override_change_groups
-        self.override_custom_field_ids = override_custom_field_ids
-
-        self._send_progress(
-            0,
-            100,
-            ConsumerFilePhase.STARTED,
-            ConsumerStatusShortMessage.NEW_FILE,
-        )
-
-        # Make sure that preconditions for consuming the file are met.
-
-        self.pre_check_file_exists()
-        self.pre_check_directories()
-        self.pre_check_duplicate()
-        self.pre_check_asn_value()
-
-        self.log.info(f"Consuming {self.filename}")
-
-        # For the actual work, copy the file into a tempdir
-        self.original_path = self.path
-        tempdir = tempfile.TemporaryDirectory(
-            prefix="paperless-ngx",
-            dir=settings.SCRATCH_DIR,
-        )
-        self.path = Path(tempdir.name) / Path(self.filename)
-        copy_file_with_basic_stats(self.original_path, self.path)
-
-        # Determine the parser class.
-
-        mime_type = magic.from_file(self.path, mime=True)
-
-        self.log.debug(f"Detected mime type: {mime_type}")
-
-        # Based on the mime type, get the parser for that type
-        parser_class: Optional[type[DocumentParser]] = get_parser_class_for_mime_type(
-            mime_type,
-        )
-        if not parser_class:
-            tempdir.cleanup()
-            self._fail(
-                ConsumerStatusShortMessage.UNSUPPORTED_TYPE,
-                f"Unsupported mime type {mime_type}",
-            )
-
-        # Notify all listeners that we're going to do some work.
-
-        document_consumption_started.send(
-            sender=self.__class__,
-            filename=self.path,
-            logging_group=self.logging_group,
-        )
-
-        self.run_pre_consume_script()
-
-        def progress_callback(current_progress, max_progress):  # pragma: no cover
-            # recalculate progress to be within 20 and 80
-            p = int((current_progress / max_progress) * 50 + 20)
-            self._send_progress(p, 100, ConsumerFilePhase.WORKING)
-
-        # This doesn't parse the document yet, but gives us a parser.
-
-        document_parser: DocumentParser = parser_class(
-            self.logging_group,
-            progress_callback,
-        )
-
-        self.log.debug(f"Parser: {type(document_parser).__name__}")
-
-        # However, this already created working directories which we have to
-        # clean up.
-
-        # Parse the document. This may take some time.
-
-        text = None
-        date = None
-        thumbnail = None
-        archive_path = None
-
-        try:
-            self._send_progress(
-                20,
-                100,
-                ConsumerFilePhase.WORKING,
-                ConsumerStatusShortMessage.PARSING_DOCUMENT,
-            )
-            self.log.debug(f"Parsing {self.filename}...")
-            document_parser.parse(self.path, mime_type, self.filename)
-
-            self.log.debug(f"Generating thumbnail for {self.filename}...")
-            self._send_progress(
-                70,
-                100,
-                ConsumerFilePhase.WORKING,
-                ConsumerStatusShortMessage.GENERATING_THUMBNAIL,
-            )
-            thumbnail = document_parser.get_thumbnail(
-                self.path,
-                mime_type,
-                self.filename,
-            )
-
-            text = document_parser.get_text()
-            date = document_parser.get_date()
-            if date is None:
-                self._send_progress(
-                    90,
-                    100,
-                    ConsumerFilePhase.WORKING,
-                    ConsumerStatusShortMessage.PARSE_DATE,
-                )
-                date = parse_date(self.filename, text)
-            archive_path = document_parser.get_archive_path()
-
-        except ParseError as e:
-            self._fail(
-                str(e),
-                f"Error occurred while consuming document {self.filename}: {e}",
-                exc_info=True,
-                exception=e,
-            )
-        except Exception as e:
-            document_parser.cleanup()
-            tempdir.cleanup()
-            self._fail(
-                str(e),
-                f"Unexpected error while consuming document {self.filename}: {e}",
-                exc_info=True,
-                exception=e,
-            )
-
-        # Prepare the document classifier.
-
-        # TODO: I don't really like to do this here, but this way we avoid
-        #   reloading the classifier multiple times, since there are multiple
-        #   post-consume hooks that all require the classifier.
-
-        classifier = load_classifier()
-
-        self._send_progress(
-            95,
-            100,
-            ConsumerFilePhase.WORKING,
-            ConsumerStatusShortMessage.SAVE_DOCUMENT,
-        )
-        # now that everything is done, we can start to store the document
-        # in the system. This will be a transaction and reasonably fast.
-        try:
-            with transaction.atomic():
-                # store the document.
-                document = self._store(text=text, date=date, mime_type=mime_type)
-
-                # If we get here, it was successful. Proceed with post-consume
-                # hooks. If they fail, nothing will get changed.
-
-                document_consumption_finished.send(
-                    sender=self.__class__,
-                    document=document,
-                    logging_group=self.logging_group,
-                    classifier=classifier,
-                )
-
-                # After everything is in the database, copy the files into
-                # place. If this fails, we'll also rollback the transaction.
-                with FileLock(settings.MEDIA_LOCK):
-                    document.filename = generate_unique_filename(document)
-                    create_source_path_directory(document.source_path)
-
-                    self._write(
-                        document.storage_type,
-                        self.original_path,
-                        document.source_path,
-                    )
-
-                    self._write(
-                        document.storage_type,
-                        thumbnail,
-                        document.thumbnail_path,
-                    )
-
-                    if archive_path and os.path.isfile(archive_path):
-                        document.archive_filename = generate_unique_filename(
-                            document,
-                            archive_filename=True,
-                        )
-                        create_source_path_directory(document.archive_path)
-                        self._write(
-                            document.storage_type,
-                            archive_path,
-                            document.archive_path,
-                        )
-
-                        with open(archive_path, "rb") as f:
-                            document.archive_checksum = hashlib.md5(
-                                f.read(),
-                            ).hexdigest()
-
-                # Don't save with the lock active. Saving will cause the file
-                # renaming logic to acquire the lock as well.
-                # This triggers things like file renaming
-                document.save()
-
-                # Delete the file only if it was successfully consumed
-                self.log.debug(f"Deleting file {self.path}")
-                os.unlink(self.path)
-                self.original_path.unlink()
-
-                # https://github.com/jonaswinkler/paperless-ng/discussions/1037
-                shadow_file = os.path.join(
-                    os.path.dirname(self.original_path),
-                    "._" + os.path.basename(self.original_path),
-                )
-
-                if os.path.isfile(shadow_file):
-                    self.log.debug(f"Deleting file {shadow_file}")
-                    os.unlink(shadow_file)
-
-        except Exception as e:
-            self._fail(
-                str(e),
-                f"The following error occurred while storing document "
-                f"{self.filename} after parsing: {e}",
-                exc_info=True,
-                exception=e,
-            )
-        finally:
-            document_parser.cleanup()
-            tempdir.cleanup()
-
-        self.run_post_consume_script(document)
-
-        self.log.info(f"Document {document} consumption finished")
-
-        self._send_progress(
-            100,
-            100,
-            ConsumerFilePhase.SUCCESS,
-            ConsumerStatusShortMessage.FINISHED,
-            document.id,
-        )
-
-        # Return the most up to date fields
-        document.refresh_from_db()
-
-        return document
-
-    def get_template_overrides(
-        self,
-        input_doc: ConsumableDocument,
-    ) -> DocumentMetadataOverrides:
-        """
-        Match consumption templates to a document based on source and
-        file name filters, path filters or mail rule filter if specified
-        """
-        overrides = DocumentMetadataOverrides()
-        for template in ConsumptionTemplate.objects.all().order_by("order"):
-            template_overrides = DocumentMetadataOverrides()
-
-            if document_matches_template(input_doc, template):
-                if template.assign_title is not None:
-                    template_overrides.title = template.assign_title
-                if template.assign_tags is not None:
-                    template_overrides.tag_ids = [
-                        tag.pk for tag in template.assign_tags.all()
-                    ]
-                if template.assign_correspondent is not None:
-                    template_overrides.correspondent_id = (
-                        template.assign_correspondent.pk
-                    )
-                if template.assign_document_type is not None:
-                    template_overrides.document_type_id = (
-                        template.assign_document_type.pk
-                    )
-                if template.assign_storage_path is not None:
-                    template_overrides.storage_path_id = template.assign_storage_path.pk
-                if template.assign_owner is not None:
-                    template_overrides.owner_id = template.assign_owner.pk
-                if template.assign_view_users is not None:
-                    template_overrides.view_users = [
-                        user.pk for user in template.assign_view_users.all()
-                    ]
-                if template.assign_view_groups is not None:
-                    template_overrides.view_groups = [
-                        group.pk for group in template.assign_view_groups.all()
-                    ]
-                if template.assign_change_users is not None:
-                    template_overrides.change_users = [
-                        user.pk for user in template.assign_change_users.all()
-                    ]
-                if template.assign_change_groups is not None:
-                    template_overrides.change_groups = [
-                        group.pk for group in template.assign_change_groups.all()
-                    ]
-                if template.assign_custom_fields is not None:
-                    template_overrides.custom_field_ids = [
-                        field.pk for field in template.assign_custom_fields.all()
-                    ]
-
-                overrides.update(template_overrides)
-        return overrides
-
     def _parse_title_placeholders(self, title: str) -> str:
         """
         Consumption template title placeholders can only include items that are
@@ -735,7 +707,7 @@ class Consumer(LoggingMixin):
             )[:127],
             content=text,
             mime_type=mime_type,
-            checksum=hashlib.md5(self.original_path.read_bytes()).hexdigest(),
+            checksum=hashlib.md5(self.input_doc.original_file.read_bytes()).hexdigest(),
             created=create_date,
             modified=create_date,
             storage_type=storage_type,

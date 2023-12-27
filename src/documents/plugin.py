@@ -61,6 +61,7 @@ class ProgressManager:
         current_progress: int,
         max_progress: int,
         task_id: Optional[str] = None,
+        extra_args: Optional[dict[str, str]] = None,
     ) -> None:
         # Ensure the layer is open
         self.open()
@@ -69,21 +70,22 @@ class ProgressManager:
         if TYPE_CHECKING:
             assert self._channel is not None
 
-        # Construct and send the update
-        async_to_sync(self._channel.group_send)(
-            "status_updates",
-            {
-                "type": "status_update",
-                "data": {
-                    "filename": self.filename,
-                    "task_id": task_id or self.task_id,
-                    "current_progress": current_progress,
-                    "max_progress": max_progress,
-                    "status": status,
-                    "message": message,
-                },
+        payload = {
+            "type": "status_update",
+            "data": {
+                "filename": self.filename,
+                "task_id": task_id or self.task_id,
+                "current_progress": current_progress,
+                "max_progress": max_progress,
+                "status": status,
+                "message": message,
             },
-        )
+        }
+        if extra_args is not None:
+            payload.update(extra_args)
+
+        # Construct and send the update
+        async_to_sync(self._channel.group_send)("status_updates", payload)
 
 
 class StopConsumeTaskError(Exception):
