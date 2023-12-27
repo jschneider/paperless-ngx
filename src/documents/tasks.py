@@ -121,6 +121,7 @@ def consume_file(
     ) as status_mgr, TemporaryDirectory(dir=settings.SCRATCH_DIR) as tmp_dir:
         tmp_dir = Path(tmp_dir)
         for plugin_class in plugins:
+            plugin_name = plugin_class.__name__
             plugin = plugin_class(
                 input_doc,
                 overrides,
@@ -128,8 +129,9 @@ def consume_file(
                 tmp_dir,
                 self.request.id,
             )
+
             if not plugin.able_to_run:
-                logger.debug(f"Skipping plugin {plugin_class}")
+                logger.debug(f"Skipping plugin {plugin_name}")
                 continue
 
             try:
@@ -138,18 +140,18 @@ def consume_file(
                 msg = plugin.run()
 
                 if msg is not None:
-                    logger.info(f"{plugin_class} completed with: {msg}")
+                    logger.info(f"{plugin_name} completed with: {msg}")
                 else:
-                    logger.info(f"{plugin_class} completed with no message")
+                    logger.info(f"{plugin_name} completed with no message")
 
                 overrides = plugin.metadata
 
             except StopConsumeTaskError as e:
-                logger.info(f"{plugin_class} requested task exit: {e.message}")
+                logger.info(f"{plugin_name} requested task exit: {e.message}")
                 return e.message
 
             except Exception as e:
-                logger.exception(f"{plugin_class} failed: {e}")
+                logger.exception(f"{plugin_name} failed: {e}")
                 status_mgr.send_progress(ProgressStatusOptions.FAILED, f"{e}", 100, 100)
                 raise
 

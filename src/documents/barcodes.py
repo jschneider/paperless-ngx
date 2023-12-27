@@ -50,6 +50,7 @@ class Barcode:
 
 
 class BarcodePlugin(ConsumeTaskPlugin):
+    @property
     def able_to_run(self) -> bool:
         """
         Able to run if:

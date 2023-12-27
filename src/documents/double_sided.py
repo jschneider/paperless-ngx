@@ -26,6 +26,7 @@ STAGING_FILE_NAME = "double-sided-staging.pdf"
 
 
 class CollatePlugin(NoCleanupPluginMixin, NoSetupPluginMixin, ConsumeTaskPlugin):
+    @property
     def able_to_run(self) -> bool:
         return (
             settings.CONSUMER_ENABLE_COLLATE_DOUBLE_SIDED

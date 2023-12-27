@@ -3,8 +3,9 @@ import uuid
 
 
 class LoggingMixin:
-    def __init__(self) -> None:
+    def __init__(self, *args, **kwargs) -> None:
         self.renew_logging_group()
+        super().__init__(*args, **kwargs)
 
     def renew_logging_group(self):
         """

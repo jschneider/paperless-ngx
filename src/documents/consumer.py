@@ -128,35 +128,15 @@ class ConsumeTemplatePlugin(
         self.metadata.update(overrides)
 
 
-class ConsumerPlugin(AlwaysRunPluginMixin, LoggingMixin, ConsumeTaskPlugin):
+class ConsumerPlugin(
+    AlwaysRunPluginMixin,
+    NoCleanupPluginMixin,
+    LoggingMixin,
+    ConsumeTaskPlugin,
+):
     logging_name = "paperless.consumer"
 
     def setup(self) -> None:
-        """
-        Allows the plugin to preform any additional setup it may need, such as creating
-        a temporary directory, copying a file somewhere, etc.
-
-        Executed before run()
-
-        In general, this should be the "light" work, not the bulk of processing
-        """
-
-        # Make sure that preconditions for consuming the file are met.
-        self.pre_check_file_exists()
-        self.pre_check_directories()
-        self.pre_check_duplicate()
-        self.pre_check_asn_value()
-
-    def run(self) -> Optional[str]:
-        """
-        The bulk of plugin processing, this does whatever action the plugin is for.
-
-        Executed after setup() and before cleanup()
-        """
-
-        """
-        Return the document object if it was successfully created.
-        """
         self.filename = self.metadata.filename or self.input_doc.original_file.name
         self.override_title = self.metadata.title
         self.override_correspondent_id = self.metadata.correspondent_id
@@ -172,6 +152,16 @@ class ConsumerPlugin(AlwaysRunPluginMixin, LoggingMixin, ConsumeTaskPlugin):
         self.override_change_groups = self.metadata.change_groups
         self.override_custom_field_ids = self.metadata.custom_field_ids
 
+        # Make sure that preconditions for consuming the file are met.
+        self.pre_check_file_exists()
+        self.pre_check_directories()
+        self.pre_check_duplicate()
+        self.pre_check_asn_value()
+
+    def run(self) -> Optional[str]:
+        """
+        Return the document object if it was successfully created.
+        """
         self._send_progress(
             0,
             100,
@@ -404,13 +394,6 @@ class ConsumerPlugin(AlwaysRunPluginMixin, LoggingMixin, ConsumeTaskPlugin):
         finally:
             document_parser.cleanup()
 
-    def cleanup(self) -> None:
-        """
-        Allows the plugin to execute any cleanup it may require
-
-        Executed after run(), even in the case of error
-        """
-
     def pre_check_file_exists(self):
         """
         Confirm the input file still exists where it should
@@ -483,7 +466,7 @@ class ConsumerPlugin(AlwaysRunPluginMixin, LoggingMixin, ConsumeTaskPlugin):
     ):  # pragma: no cover
         self.status_mgr.send_progress(
             status=status,
-            msg=message,
+            message=message,
             current_progress=current_progress,
             max_progress=max_progress,
             extra_args={
@@ -691,7 +674,7 @@ class ConsumerPlugin(AlwaysRunPluginMixin, LoggingMixin, ConsumeTaskPlugin):
             create_date = date
             self.log.debug(f"Creation date from parse_date: {create_date}")
         else:
-            stats = os.stat(self.original_path)
+            stats = os.stat(self.input_doc.original_file)
             create_date = timezone.make_aware(
                 datetime.datetime.fromtimestamp(stats.st_mtime),
             )

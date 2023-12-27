@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 from typing import Final
 from typing import Optional
+from typing import Union
 
 from asgiref.sync import async_to_sync
 from channels.layers import get_channel_layer
@@ -60,8 +61,7 @@ class ProgressManager:
         message: str,
         current_progress: int,
         max_progress: int,
-        task_id: Optional[str] = None,
-        extra_args: Optional[dict[str, str]] = None,
+        extra_args: Optional[dict[str, Union[str, int]]] = None,
     ) -> None:
         # Ensure the layer is open
         self.open()
@@ -74,7 +74,7 @@ class ProgressManager:
             "type": "status_update",
             "data": {
                 "filename": self.filename,
-                "task_id": task_id or self.task_id,
+                "task_id": self.task_id,
                 "current_progress": current_progress,
                 "max_progress": max_progress,
                 "status": status,
@@ -182,6 +182,7 @@ class ConsumeTaskPlugin(abc.ABC):
 
 
 class AlwaysRunPluginMixin(ConsumeTaskPlugin):
+    @property
     def able_to_run(self) -> bool:
         return True
 
