@@ -17,7 +17,7 @@ show-fixes = true
 "*/tests/*.py" = ["E501", "SIM117"]
 "*/migrations/*.py" = ["E501", "SIM"]
 "src/paperless_tesseract/tests/test_parser.py" = ["RUF001"]
-"src/documents/models.py" = ["SIM115"]
+"src/documents/models.py" = ["SIM115", "DJ008"]
 
 [isort]
 force-single-line = true
