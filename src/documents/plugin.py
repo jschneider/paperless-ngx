@@ -82,7 +82,7 @@ class ProgressManager:
             },
         }
         if extra_args is not None:
-            payload.update(extra_args)
+            payload["data"].update(extra_args)
 
         # Construct and send the update
         async_to_sync(self._channel.group_send)("status_updates", payload)
