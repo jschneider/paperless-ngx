@@ -1777,7 +1777,7 @@
           <context context-type="sourcefile">src/app/components/admin/tasks/tasks.component.ts</context>
           <context context-type="linenumber">139</context>
         </context-group>
-        <target state="translated">fallida/s</target>
+        <target state="translated">fallidas</target>
       </trans-unit>
       <trans-unit id="8119815638230251386" datatype="html">
         <source>Users &amp; Groups</source>

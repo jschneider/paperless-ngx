@@ -3,7 +3,7 @@ msgstr ""
 "Project-Id-Version: paperless-ngx\n"
 "Report-Msgid-Bugs-To: \n"
 "POT-Creation-Date: 2023-12-09 10:53-0800\n"
-"PO-Revision-Date: 2023-12-28 12:09\n"
+"PO-Revision-Date: 2023-12-31 00:26\n"
 "Last-Translator: \n"
 "Language-Team: Polish\n"
 "Language: pl_PL\n"
@@ -116,7 +116,7 @@ msgstr "ścieżka przechowywania"
 
 #: documents/models.py:130
 msgid "storage paths"
-msgstr "ścieżki przechowywania"
+msgstr "ścieżki składowania"
 
 #: documents/models.py:137
 msgid "Unencrypted"
@@ -253,7 +253,7 @@ msgstr "log"
 
 #: documents/models.py:390
 msgid "logs"
-msgstr "logi"
+msgstr "dziennik"
 
 #: documents/models.py:399 documents/models.py:466
 msgid "saved view"
@@ -425,7 +425,7 @@ msgstr "nie ma właściciela w"
 
 #: documents/models.py:458
 msgid "has custom field value"
-msgstr "ma wartość pola niestandardowego"
+msgstr "ma wartość pola dodatkowego"
 
 #: documents/models.py:459
 msgid "is shared by me"
@@ -597,19 +597,19 @@ msgstr "typ danych"
 
 #: documents/models.py:781
 msgid "custom field"
-msgstr "pole niestandardowe"
+msgstr "pole dodatkowe"
 
 #: documents/models.py:782
 msgid "custom fields"
-msgstr "pola niestandardowe"
+msgstr "pola dodatkowe"
 
 #: documents/models.py:844
 msgid "custom field instance"
-msgstr "przykład pola niestandardowego"
+msgstr "przypisane pole dodatkowe"
 
 #: documents/models.py:845
 msgid "custom field instances"
-msgstr "przykłady pól niestandardowych"
+msgstr "przypisanych pól dodatkowych"
 
 #: documents/models.py:893
 msgid "Consume Folder"
